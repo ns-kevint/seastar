@@ -46,7 +46,6 @@
 using namespace seastar;
 namespace bpo = boost::program_options;
 
-
 struct NsTunnelFrameHeader
 {
     uint16_t    m_controlVersion; //!< contains control and version
@@ -572,13 +571,16 @@ public:
         tls::tls_options options;
         return tls::connect(certs, server_addr, options).then([this](::connected_socket s) {
             auto strms = new streams(std::move(s));
+            using namespace std::chrono_literals;
             return sendSynTunnel(strms).then([this, strms]() {
+//            return seastar::sleep(0s).then([this, strms]() {
                 return recvSendSynTunnelAuth(strms).then([this, strms]() {
-//                    delete m_buf;
+//                  delete m_buf;
 //                  return strms->out.close().then([strms]() {
 //                  return strms->in.close();
                     return strms;
                 });
+//            });
             });
         });
     }
@@ -587,6 +589,46 @@ public:
 uint32_t g_count = 0;
 uint32_t g_clientNum = 40000;
 auto g_clients = std::make_unique<NsClient[]>(g_clientNum);
+
+class Benchmark {
+public:
+    struct Params {
+        Params() {}
+
+        bool wait;          // Don't close connection.
+        uint32_t iteration;
+        uint32_t parallel;
+
+        seastar::shared_ptr<tls::certificate_credentials> certPtr;
+        ipv4_addr gwIp;     // NSGW IP
+    };
+
+    Benchmark(Params p) : m_params(p) {}
+
+    future<> perfEstablishTunnel() {
+        auto range = std::views::iota(size_t(0), m_params.iteration);
+        return do_for_each(range, [this](int i) {
+            size_t begin = i * m_params.parallel;
+            size_t end = begin + m_params.parallel;
+            return parallel_for_each(std::views::iota(begin, end), [this] (int index) {
+                return g_clients[index].start(m_params.gwIp, m_params.certPtr).then([index] (auto strms) {
+                    //g_clients[index].m_strms = strms;
+                    ++g_count;
+                });
+            }).then([] () {
+                std::cout << g_count << " clients connected..." << std::endl;
+            });
+
+        }).then([this]() {
+            if (!m_params.wait) engine().exit(0);
+        });
+    
+    }
+
+private:
+    Params m_params;
+};
+
 int main(int ac, char** av) {
     /* Load Multiple providers into the default (NULL) library context */
     OSSL_PROVIDER *legacy = OSSL_PROVIDER_load(NULL, "legacy");
@@ -622,8 +664,8 @@ int main(int ac, char** av) {
                     ("address", bpo::value<std::string>()->default_value("127.0.0.1"), "Remote address")
                     ("trust,t", bpo::value<std::string>(), "Trust store")
                     ("msg,m", bpo::value<std::string>(), "Message to send")
-                    ("parallel,p", bpo::value<size_t>()->default_value(1), "Burst X requests")
-                    ("iterations,i", bpo::value<size_t>()->default_value(1), "Repeat X times")
+                    ("parallel,p", bpo::value<uint32_t>()->default_value(1), "Burst X requests")
+                    ("iterations,i", bpo::value<uint32_t>()->default_value(1), "Repeat X times")
                     ("read-response,r", bpo::value<bool>()->default_value(true)->implicit_value(true), "Read echoed message")
                     ("verbose,v", bpo::value<bool>()->default_value(false)->implicit_value(true), "Verbose operation")
                     ("wait,w", bpo::value<bool>()->default_value(false)->implicit_value(true), "Won't close connection")
@@ -631,40 +673,28 @@ int main(int ac, char** av) {
                     ;
 
 
+    Benchmark::Params params;
     return app.run_deprecated(ac, av, [&] {
         auto&& config = app.configuration();
         uint16_t port = config["port"].as<uint16_t>();
         auto addr = config["address"].as<std::string>();
-        auto iter = config["iterations"].as<size_t>();
-        size_t parallel = config["parallel"].as<size_t>();
-        bool wait = config["wait"].as<bool>();
+        params.iteration = config["iterations"].as<uint32_t>();
+        params.parallel = config["parallel"].as<uint32_t>();
+        params.wait = config["wait"].as<bool>();
 
-        std::cout << "Starting..." << std::endl;
+        std::cout << "Starting: " << seastar::smp::count << " threads." << std::endl;
 
-        auto certs = ::make_shared<tls::certificate_credentials>();
+        params.certPtr = ::make_shared<tls::certificate_credentials>();
         auto f = make_ready_future();
 
         if (config.count("trust")) {
-            f = certs->set_x509_trust_file(config["trust"].as<std::string>(), tls::x509_crt_format::PEM);
+            f = params.certPtr->set_x509_trust_file(config["trust"].as<std::string>(), tls::x509_crt_format::PEM);
         }
 
-        ipv4_addr ia(addr, port);
+        params.gwIp = std::move(ipv4_addr(addr, port));
+        auto bmPtr = seastar::make_shared<Benchmark>(params);
         
-        auto range = std::views::iota(size_t(0), iter);
-        return do_for_each(range, [ia, certs, parallel](int i) {
-            size_t begin = i * parallel;
-            size_t end = begin + parallel;
-            return parallel_for_each(std::views::iota(begin, end), [ia, certs] (int index) {
-                return g_clients[index].start(ia, certs).then([index] (auto strms) {
-                    //g_clients[index].m_strms = strms;
-                    ++g_count;
-                });
-            }).then([] () {
-                std::cout << g_count << " clients connected..." << std::endl;
-            });
 
-        }).then([wait]() {
-            if (!wait) engine().exit(0);
-        });
+        return bmPtr->perfEstablishTunnel();
     });
 }
